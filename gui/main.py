@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -47,17 +48,20 @@ from train_segment import list_experiments
 
 class TrainWorker(QThread):
     log_line = Signal(str)
+    progress = Signal(int)
     failed = Signal(str)
     finished_ok = Signal()
     stopped = Signal()
 
-    def __init__(self, cmd):
+    def __init__(self, cmd, env=None):
         super().__init__()
         self._cmd = cmd
+        self._env = env
         self._process = None
         self._aborted = False
 
     def run(self):
+        import re
         self._process = subprocess.Popen(
             self._cmd,
             stdout=subprocess.PIPE,
@@ -65,12 +69,24 @@ class TrainWorker(QThread):
             text=True,
             bufsize=1,
             cwd=str(ROOT),
+            env=self._env,
         )
         try:
             for line in self._process.stdout:
-                line = line.rstrip("\n").rstrip("\r")
-                if line:
-                    self.log_line.emit(line)
+                line_stripped = line.rstrip("\n").rstrip("\r")
+                if line_stripped:
+                    self.log_line.emit(line_stripped)
+                # 解析 YOLO epoch 进度，匹配 "3/150" 模式
+                if not line_stripped:
+                    continue
+                m = re.search(r"\b(\d+)\s*/\s*(\d+)\b", line_stripped)
+                if m:
+                    cur, total = int(m.group(1)), int(m.group(2))
+                    low = line_stripped.lower()
+                    if 1 <= cur <= total and total >= 10 and not any(
+                        kw in low for kw in ("transfer", "gflops", "summary", "param", "module", "cuda", "gradient", "amp", "fuse")
+                    ):
+                        self.progress.emit(cur)
         except (IOError, OSError):
             pass
         self._process.wait()
@@ -503,6 +519,21 @@ class MainWindow(QWidget):
         btn_row.addStretch()
         outer.addLayout(btn_row)
 
+        # ── 进度条 ──
+        outer.addSpacing(4)
+        self.tr_progress = QProgressBar()
+        self.tr_progress.setRange(0, 100)
+        self.tr_progress.setValue(0)
+        self.tr_progress.setFixedHeight(14)
+        self.tr_progress.setTextVisible(True)
+        self.tr_progress.setFormat("Epoch %v / %m")
+        self.tr_progress.setStyleSheet(
+            "QProgressBar { background: #e8e8ed; border: none; border-radius: 7px; "
+            "font-size: 10px; color: #1d1d1f; text-align: center; }"
+            "QProgressBar::chunk { background: #0071e3; border-radius: 7px; }"
+        )
+        outer.addWidget(self.tr_progress)
+
         # ── 日志 ──
         outer.addWidget(_field_label("输出"))
         self.tr_log = _log_area()
@@ -694,6 +725,7 @@ class MainWindow(QWidget):
             self.btn_stop.setEnabled(True)
             self.btn_stop.clicked.disconnect()
             self.btn_stop.clicked.connect(self._on_stop_train)
+            self.tr_progress.setValue(0)
         elif state == "stopped":
             self.btn_start.setText("继续训练")
             self.btn_start.setEnabled(True)
@@ -710,6 +742,9 @@ class MainWindow(QWidget):
             self.rb_new.setChecked(True)
             self.btn_stop.clicked.disconnect()
             self.btn_stop.clicked.connect(self._on_stop_train)
+            self.tr_progress.setRange(0, 100)
+            self.tr_progress.setValue(0)
+            self.tr_progress.setFormat("%p%")
 
     def _build_config_from_train_ui(self):
         c = TrainConfig()
@@ -805,9 +840,16 @@ class MainWindow(QWidget):
             cmd.extend(["--selected-exp", selected])
 
         self._set_train_ui_state("running")
+        self.tr_progress.setRange(0, cfg.epochs)
+        self.tr_progress.setValue(0)
+        self.tr_progress.setFormat(f"Epoch %v / {cfg.epochs}")
 
-        self._train_worker = TrainWorker(cmd)
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+
+        self._train_worker = TrainWorker(cmd, env=env)
         self._train_worker.log_line.connect(self._append_train_log)
+        self._train_worker.progress.connect(self._on_train_progress)
         self._train_worker.failed.connect(self._on_train_failed)
         self._train_worker.finished_ok.connect(self._on_train_done)
         self._train_worker.stopped.connect(self._on_train_stopped)
@@ -817,6 +859,11 @@ class MainWindow(QWidget):
     @Slot(str)
     def _append_train_log(self, line):
         self.tr_log.append(f'<span style="color:#c0c0c0;">{line}</span>')
+        self.tr_log.moveCursor(QTextCursor.MoveOperation.End)
+
+    @Slot(int)
+    def _on_train_progress(self, pct: int) -> None:
+        self.tr_progress.setValue(pct)
 
     @Slot()
     def _on_stop_train(self):
@@ -998,14 +1045,17 @@ class MainWindow(QWidget):
         self.btn_infer.setVisible(False)
         self.btn_stop_ir.setVisible(True)
         self._infer_worker = InferWorker(cmd)
-        self._infer_worker.log_line.connect(
-            lambda line: self.ir_log.append(f'<span style="color:#c0c0c0;">{line}</span>')
-        )
+        self._infer_worker.log_line.connect(self._append_infer_log)
         self._infer_worker.failed.connect(self._on_infer_failed)
         self._infer_worker.finished_ok.connect(self._on_infer_done)
         self._infer_worker.stopped.connect(self._on_infer_stopped)
         self._infer_worker.finished.connect(self._on_infer_thread_finished)
         self._infer_worker.start()
+
+    @Slot(str)
+    def _append_infer_log(self, line: str) -> None:
+        self.ir_log.append(f'<span style="color:#c0c0c0;">{line}</span>')
+        self.ir_log.moveCursor(QTextCursor.MoveOperation.End)
 
     @Slot()
     def _on_stop_infer(self):
