@@ -1,6 +1,8 @@
 import os
+import sys
+import tempfile
 import yaml
-import shutil   # 用于删除临时验证结果文件夹 
+import shutil   # 用于删除临时验证结果文件夹
 import argparse
 from ultralytics import YOLO
 from config import TrainConfig
@@ -63,6 +65,7 @@ def parse_args():
 
     示例：
     python train.py --epochs 200 --batch 8 --device 0 --name exp_test
+    python train.py --no-interactive --mode 1 --use-augment --epochs 150
     """
     parser = argparse.ArgumentParser(description="YOLO training script")
 
@@ -71,6 +74,17 @@ def parse_args():
     parser.add_argument("--batch", type=int, default=None, help="每批次训练图片数量")
     parser.add_argument("--device", type=str, default=None, help="训练设备，如 0 / 0,1 / cpu")
     parser.add_argument("--name", type=str, default=None, help="实验名称")
+    parser.add_argument("--data-yaml", type=str, default=None, help="data.yaml 配置文件路径")
+    parser.add_argument("--model-file", type=str, default=None, help="初始模型权重路径")
+    parser.add_argument("--results-dir", type=str, default=None, help="实验结果保存根目录")
+    parser.add_argument("--log-dir", type=str, default=None, help="日志保存目录")
+
+    # 无交互模式（供 GUI 等调用方使用）
+    parser.add_argument("--no-interactive", action="store_true", help="无交互模式，跳过所有提示")
+    parser.add_argument("--mode", type=int, choices=[1, 2, 3], default=None, help="训练模式: 1=新训练 2=续训 3=基于历史best")
+    parser.add_argument("--use-augment", action="store_true", default=None, dest="use_augment", help="启用数据增强")
+    parser.add_argument("--no-augment", action="store_false", default=None, dest="use_augment", help="禁用数据增强")
+    parser.add_argument("--selected-exp", type=str, default=None, help="模式3下选中的历史实验目录名")
 
     return parser.parse_args()
 
@@ -96,8 +110,85 @@ def override_config_from_args(config, args):
         config.device = args.device
     if args.name is not None:
         config.experiment_name = args.name
+    if args.data_yaml is not None:
+        config.data_yaml = args.data_yaml
+    if args.model_file is not None:
+        config.model_file = args.model_file
+    if args.results_dir is not None:
+        config.results_dir = args.results_dir
+    if args.log_dir is not None:
+        config.log_dir = args.log_dir
 
     return config
+
+
+# =========================
+# 无交互模式入口（供 GUI / CI 等外部调用方使用）
+# =========================
+def _resolve_data_yaml(data_yaml_path: str) -> str:
+    """将 data.yaml 中的相对 path 解析为绝对路径，写入临时文件后返回其路径。"""
+    yaml_dir = os.path.dirname(os.path.abspath(data_yaml_path))
+    with open(data_yaml_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    path_val = data.get("path", "")
+    if path_val and not os.path.isabs(path_val):
+        data["path"] = os.path.normpath(os.path.join(yaml_dir, path_val))
+
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8")
+        yaml.dump(data, tmp, allow_unicode=True, default_flow_style=False)
+        tmp.close()
+        print(f"已修正数据集路径: {path_val} → {data['path']}")
+        return tmp.name
+
+    return data_yaml_path
+
+
+def run_non_interactive(args):
+    """根据命令行参数直接运行训练，不弹出任何交互提示。"""
+    config = TrainConfig()
+    config = override_config_from_args(config, args)
+
+    # 修正 data.yaml 中的相对路径，避免 ultralytics 将其解析到全局 datasets 目录
+    _original_data_yaml = config.data_yaml
+    config.data_yaml = _resolve_data_yaml(config.data_yaml)
+
+    try:
+        mode = args.mode
+        if mode is None:
+            print("错误：无交互模式必须指定 --mode (1/2/3)")
+            sys.exit(1)
+
+        use_augment = args.use_augment if args.use_augment is not None else config.use_augment
+
+        if mode == 1:
+            print(f"开始新训练 — 实验: {config.experiment_name}")
+            print(f"权重: {config.model_file}  |  epochs={config.epochs}  imgsz={config.imgsz}  batch={config.batch}  device={config.device}")
+            print(f"数据增强: {'开启' if use_augment else '关闭'}")
+            execute_new_training(config, use_augment)
+
+        elif mode == 2:
+            if not os.path.exists(config.last_pt):
+                print(f"未找到续训权重，改为新训练: {config.last_pt}")
+                print(f"权重: {config.model_file}  |  epochs={config.epochs}  imgsz={config.imgsz}  batch={config.batch}  device={config.device}")
+                execute_new_training(config, use_augment)
+            else:
+                print(f"继续训练 — 实验: {config.experiment_name}")
+                print(f"权重: {config.last_pt}")
+                execute_resume_training(config)
+
+        elif mode == 3:
+            selected_exp = args.selected_exp
+            if not selected_exp:
+                print("错误：模式3必须指定 --selected-exp")
+                sys.exit(1)
+            print(f"基于历史实验继续训练 — {selected_exp}")
+            print(f"epochs={config.epochs}  imgsz={config.imgsz}  batch={config.batch}  device={config.device}")
+            print(f"数据增强: {'开启' if use_augment else '关闭'}")
+            execute_train_from_previous_best(config, selected_exp, use_augment)
+    finally:
+        if config.data_yaml != _original_data_yaml and os.path.exists(config.data_yaml):
+            os.unlink(config.data_yaml)
 
 
 # =========================
@@ -458,6 +549,11 @@ def train_from_previous_best(config):
 def main():
     global CONFIG
     args = parse_args()
+
+    if args.no_interactive:
+        run_non_interactive(args)
+        return
+
     CONFIG = override_config_from_args(CONFIG, args)
 
     print("请选择训练模式：")

@@ -4,12 +4,10 @@ YOLO 分割训练 / 推理桌面界面 — Apple 风格简约设计
 """
 from __future__ import annotations
 
-import io
 import json
 import os
 import subprocess
 import sys
-import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -44,91 +42,101 @@ from PySide6.QtWidgets import (
 )
 
 from config import TrainConfig
-from predict_test import InferConfig, YOLOInferencer
-from train_segment import (
-    execute_new_training,
-    execute_resume_training,
-    execute_train_from_previous_best,
-    list_experiments,
-)
-
-
-class _TeeOut(io.TextIOBase):
-    def __init__(self, original, emit_fn):
-        super().__init__()
-        self._original = original
-        self._emit = emit_fn
-
-    def write(self, s: str) -> int:
-        try:
-            self._original.write(s)
-        except Exception:
-            pass
-        if s and s.strip():
-            for line in s.rstrip("\n").split("\n"):
-                if line.strip():
-                    self._emit(line)
-        return len(s)
-
-    def flush(self) -> None:
-        try:
-            self._original.flush()
-        except Exception:
-            pass
+from train_segment import list_experiments
 
 
 class TrainWorker(QThread):
     log_line = Signal(str)
     failed = Signal(str)
     finished_ok = Signal()
+    stopped = Signal()
 
-    def __init__(self, config, mode, use_augment, selected_exp=None):
+    def __init__(self, cmd):
         super().__init__()
-        self._config = config
-        self._mode = mode
-        self._use_augment = use_augment
-        self._selected_exp = selected_exp or ""
+        self._cmd = cmd
+        self._process = None
+        self._aborted = False
 
     def run(self):
-        old = sys.stdout
-        sys.stdout = _TeeOut(old, self.log_line.emit)
+        self._process = subprocess.Popen(
+            self._cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            cwd=str(ROOT),
+        )
         try:
-            if self._mode == 1:
-                execute_new_training(self._config, self._use_augment)
-            elif self._mode == 2:
-                execute_resume_training(self._config)
-            elif self._mode == 3:
-                if not self._selected_exp:
-                    raise ValueError("请先选择历史实验目录。")
-                execute_train_from_previous_best(
-                    self._config, self._selected_exp, self._use_augment
-                )
+            for line in self._process.stdout:
+                line = line.rstrip("\n").rstrip("\r")
+                if line:
+                    self.log_line.emit(line)
+        except (IOError, OSError):
+            pass
+        self._process.wait()
+        if self._aborted:
+            self.stopped.emit()
+        elif self._process.returncode == 0:
             self.finished_ok.emit()
-        except Exception as e:
-            self.failed.emit(f"{e}\n{traceback.format_exc()}")
-        finally:
-            sys.stdout = old
+        else:
+            self.failed.emit(f"进程退出码: {self._process.returncode}")
+
+    def stop(self):
+        self._aborted = True
+        if self._process and self._process.poll() is None:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait()
 
 
 class InferWorker(QThread):
     log_line = Signal(str)
     failed = Signal(str)
     finished_ok = Signal()
+    stopped = Signal()
 
-    def __init__(self, cfg):
+    def __init__(self, cmd):
         super().__init__()
-        self._cfg = cfg
+        self._cmd = cmd
+        self._process = None
+        self._aborted = False
 
     def run(self):
-        old = sys.stdout
-        sys.stdout = _TeeOut(old, self.log_line.emit)
+        self._process = subprocess.Popen(
+            self._cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            cwd=str(ROOT),
+        )
         try:
-            YOLOInferencer(self._cfg).run()
+            for line in self._process.stdout:
+                line = line.rstrip("\n").rstrip("\r")
+                if line:
+                    self.log_line.emit(line)
+        except (IOError, OSError):
+            pass
+        self._process.wait()
+        if self._aborted:
+            self.stopped.emit()
+        elif self._process.returncode == 0:
             self.finished_ok.emit()
-        except Exception as e:
-            self.failed.emit(f"{e}\n{traceback.format_exc()}")
-        finally:
-            sys.stdout = old
+        else:
+            self.failed.emit(f"进程退出码: {self._process.returncode}")
+
+    def stop(self):
+        self._aborted = True
+        if self._process and self._process.poll() is None:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait()
 
 
 # ── 预设管理 ──────────────────────────────────────────────
@@ -262,6 +270,17 @@ def _tiny_btn(text):
         "QPushButton { background: transparent; color: #0071e3; border: none; "
         "padding: 2px 6px; font-size: 12px; }"
         "QPushButton:hover { color: #0077ed; text-decoration: underline; }"
+    )
+    return b
+
+
+def _danger_btn(text):
+    b = QPushButton(text)
+    b.setStyleSheet(
+        "QPushButton { background: #ff3b30; color: #fff; border: none; "
+        "border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 500; }"
+        "QPushButton:hover { background: #ff453a; }"
+        "QPushButton:pressed { background: #d63028; }"
     )
     return b
 
@@ -444,6 +463,12 @@ class MainWindow(QWidget):
         self.btn_start.setFixedHeight(38)
         self.btn_start.clicked.connect(self._on_start_train)
         btn_row.addWidget(self.btn_start)
+
+        self.btn_stop = _danger_btn("停止训练")
+        self.btn_stop.setFixedHeight(38)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._on_stop_train)
+        btn_row.addWidget(self.btn_stop)
 
         self.btn_reset = _btn("恢复默认", primary=False)
         self.btn_reset.setFixedHeight(38)
@@ -661,6 +686,31 @@ class MainWindow(QWidget):
 
     # ── 训练 ──
 
+    def _set_train_ui_state(self, state: str) -> None:
+        """统一管理训练按钮与模式单选的状态切换。"""
+        if state == "running":
+            self.btn_start.setEnabled(False)
+            self.btn_stop.setText("停止训练")
+            self.btn_stop.setEnabled(True)
+            self.btn_stop.clicked.disconnect()
+            self.btn_stop.clicked.connect(self._on_stop_train)
+        elif state == "stopped":
+            self.btn_start.setText("继续训练")
+            self.btn_start.setEnabled(True)
+            self.btn_stop.setText("结束训练")
+            self.btn_stop.setEnabled(True)
+            self.rb_resume.setChecked(True)
+            self.btn_stop.clicked.disconnect()
+            self.btn_stop.clicked.connect(self._on_end_train)
+        else:  # idle / completed / failed
+            self.btn_start.setText("开始训练")
+            self.btn_start.setEnabled(True)
+            self.btn_stop.setText("停止训练")
+            self.btn_stop.setEnabled(False)
+            self.rb_new.setChecked(True)
+            self.btn_stop.clicked.disconnect()
+            self.btn_stop.clicked.connect(self._on_stop_train)
+
     def _build_config_from_train_ui(self):
         c = TrainConfig()
         c.data_yaml = _path_combo_get(self.tr_data_yaml)
@@ -731,12 +781,36 @@ class MainWindow(QWidget):
         self.tr_log.clear()
         self._log_info(f"开始训练 — {cfg.experiment_name}")
         self._log_info(f"epochs={cfg.epochs}  imgsz={cfg.imgsz}  batch={cfg.batch}  device={cfg.device}")
-        self.btn_start.setEnabled(False)
 
-        self._train_worker = TrainWorker(cfg, mode, use_aug, selected if mode == 3 else None)
+        # 构建子进程命令行
+        cmd = [
+            sys.executable, str(SCRIPTS / "train_segment.py"),
+            "--no-interactive",
+            "--mode", str(mode),
+            "--data-yaml", cfg.data_yaml,
+            "--model-file", cfg.model_file,
+            "--results-dir", cfg.results_dir,
+            "--log-dir", cfg.log_dir,
+            "--epochs", str(cfg.epochs),
+            "--imgsz", str(cfg.imgsz),
+            "--batch", str(cfg.batch),
+            "--device", cfg.device,
+            "--name", cfg.experiment_name,
+        ]
+        if use_aug:
+            cmd.append("--use-augment")
+        else:
+            cmd.append("--no-augment")
+        if mode == 3 and selected:
+            cmd.extend(["--selected-exp", selected])
+
+        self._set_train_ui_state("running")
+
+        self._train_worker = TrainWorker(cmd)
         self._train_worker.log_line.connect(self._append_train_log)
         self._train_worker.failed.connect(self._on_train_failed)
         self._train_worker.finished_ok.connect(self._on_train_done)
+        self._train_worker.stopped.connect(self._on_train_stopped)
         self._train_worker.finished.connect(self._on_train_thread_finished)
         self._train_worker.start()
 
@@ -744,21 +818,40 @@ class MainWindow(QWidget):
     def _append_train_log(self, line):
         self.tr_log.append(f'<span style="color:#c0c0c0;">{line}</span>')
 
+    @Slot()
+    def _on_stop_train(self):
+        if self._train_worker and self._train_worker.isRunning():
+            self._log_warn("正在停止训练...")
+            self._train_worker.stop()
+
     @Slot(str)
     def _on_train_failed(self, msg):
         self._log_err("训练失败")
         self.tr_log.append(f'<span style="color:#ff6e6e;">{msg[:1500]}</span>')
         QMessageBox.critical(self, "训练失败", msg[:2000])
+        self._set_train_ui_state("idle")
+        self._refresh_history()
 
     @Slot()
     def _on_train_done(self):
         self._log_good("训练完成")
         QMessageBox.information(self, "完成", "训练流程已结束。")
+        self._set_train_ui_state("idle")
         self._refresh_history()
 
     @Slot()
+    def _on_train_stopped(self):
+        self._log_warn("训练已暂停 — 可点击「继续训练」恢复，或点击「结束训练」终止本次会话")
+        self._set_train_ui_state("stopped")
+
+    @Slot()
+    def _on_end_train(self):
+        self._log_info("本次训练会话已结束")
+        self._set_train_ui_state("idle")
+
+    @Slot()
     def _on_train_thread_finished(self):
-        self.btn_start.setEnabled(True)
+        pass  # 按钮状态已由具体结果 handler 处理
 
     # ═══════════════════════════════════════════════════════
     #  推理页
@@ -814,10 +907,22 @@ class MainWindow(QWidget):
         lay1.addLayout(conf_row)
         outer.addWidget(card1)
 
+        ir_btn_row = QHBoxLayout()
+        ir_btn_row.setSpacing(10)
+
         self.btn_infer = _btn("开始推理")
         self.btn_infer.setFixedHeight(38)
         self.btn_infer.clicked.connect(self._on_start_infer)
-        outer.addWidget(self.btn_infer)
+        ir_btn_row.addWidget(self.btn_infer)
+
+        self.btn_stop_ir = _danger_btn("停止推理")
+        self.btn_stop_ir.setFixedHeight(38)
+        self.btn_stop_ir.setVisible(False)
+        self.btn_stop_ir.clicked.connect(self._on_stop_infer)
+        ir_btn_row.addWidget(self.btn_stop_ir)
+
+        ir_btn_row.addStretch()
+        outer.addLayout(ir_btn_row)
 
         outer.addWidget(_field_label("输出"))
         self.ir_log = _log_area()
@@ -859,32 +964,54 @@ class MainWindow(QWidget):
         if self._infer_worker and self._infer_worker.isRunning():
             QMessageBox.warning(self, "提示", "推理正在进行中。")
             return
-        cfg = InferConfig(
-            model_path=_path_combo_get(self.ir_model),
-            source=_path_combo_get(self.ir_source),
-            save_dir=_path_combo_get(self.ir_save),
-            conf=float(self.ir_conf.text().strip() or "0.25"),
-            imgsz=int(self.ir_imgsz.value()),
-            task_param_file=str(SCRIPTS / "infer_task_params.json"),
-        )
-        if not Path(cfg.model_path).is_file():
-            QMessageBox.critical(self, "错误", f"找不到模型：\n{cfg.model_path}")
+
+        model_path = _path_combo_get(self.ir_model)
+        source = _path_combo_get(self.ir_source)
+        save_dir = _path_combo_get(self.ir_save)
+        conf = self.ir_conf.text().strip()
+        try:
+            conf_val = float(conf) if conf else 0.25
+        except ValueError:
+            QMessageBox.critical(self, "错误", f"Conf 值无效: {conf}")
             return
-        if not Path(cfg.source).exists():
-            QMessageBox.critical(self, "错误", f"找不到输入：\n{cfg.source}")
+        imgsz_val = int(self.ir_imgsz.value())
+
+        if not Path(model_path).is_file():
+            QMessageBox.critical(self, "错误", f"找不到模型：\n{model_path}")
+            return
+        if not Path(source).exists():
+            QMessageBox.critical(self, "错误", f"找不到输入：\n{source}")
             return
 
         self.ir_log.clear()
-        self._log_info_ir(f"开始推理 — {cfg.model_path}")
-        self.btn_infer.setEnabled(False)
-        self._infer_worker = InferWorker(cfg)
+        self._log_info_ir(f"开始推理 — {model_path}")
+
+        cmd = [
+            sys.executable, str(SCRIPTS / "predict_test.py"),
+            "--model", model_path,
+            "--source", source,
+            "--save-dir", save_dir,
+            "--conf", str(conf_val),
+            "--imgsz", str(imgsz_val),
+        ]
+
+        self.btn_infer.setVisible(False)
+        self.btn_stop_ir.setVisible(True)
+        self._infer_worker = InferWorker(cmd)
         self._infer_worker.log_line.connect(
             lambda line: self.ir_log.append(f'<span style="color:#c0c0c0;">{line}</span>')
         )
         self._infer_worker.failed.connect(self._on_infer_failed)
         self._infer_worker.finished_ok.connect(self._on_infer_done)
+        self._infer_worker.stopped.connect(self._on_infer_stopped)
         self._infer_worker.finished.connect(self._on_infer_thread_finished)
         self._infer_worker.start()
+
+    @Slot()
+    def _on_stop_infer(self):
+        if self._infer_worker and self._infer_worker.isRunning():
+            self.ir_log.append(f'<span style="color:#ffb86c;">[warn]</span>  正在停止推理...')
+            self._infer_worker.stop()
 
     @Slot(str)
     def _on_infer_failed(self, msg):
@@ -898,8 +1025,13 @@ class MainWindow(QWidget):
         QMessageBox.information(self, "完成", "推理已结束。")
 
     @Slot()
+    def _on_infer_stopped(self):
+        self.ir_log.append(f'<span style="color:#ffb86c;">[warn]</span>  推理已停止')
+
+    @Slot()
     def _on_infer_thread_finished(self):
-        self.btn_infer.setEnabled(True)
+        self.btn_infer.setVisible(True)
+        self.btn_stop_ir.setVisible(False)
 
 
 def main():

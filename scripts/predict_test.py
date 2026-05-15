@@ -118,13 +118,23 @@ class YOLOInferencer:
 
 
 if __name__ == "__main__":
+    import argparse
+
     _sd = Path(__file__).resolve().parent
+    parser = argparse.ArgumentParser(description="YOLO 推理脚本")
+    parser.add_argument("--model", default=BEST_SEG_MODEL, help="模型权重路径")
+    parser.add_argument("--source", default=TEST_IMAGES_DIR, help="输入源（图像/目录）")
+    parser.add_argument("--save-dir", default=str(Path(PREDICT_DIR) / "overlay_run_v2"), help="输出保存目录")
+    parser.add_argument("--conf", type=float, default=0.406, help="置信度阈值")
+    parser.add_argument("--imgsz", type=int, default=640, help="输入图像尺寸")
+    args = parser.parse_args()
+
     cfg = InferConfig(
-        model_path=BEST_SEG_MODEL,
-        source=TEST_IMAGES_DIR,
-        save_dir=str(Path(PREDICT_DIR) / "overlay_run_v2"),
-        conf=0.406,
-        imgsz=640,
+        model_path=args.model,
+        source=args.source,
+        save_dir=args.save_dir,
+        conf=args.conf,
+        imgsz=args.imgsz,
         task_param_file=str(_sd / "infer_task_params.json"),
         out_suffix="_overlay.jpg",
     )
