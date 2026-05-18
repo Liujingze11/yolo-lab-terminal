@@ -325,12 +325,21 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "提示", f"文件不存在：\n{p}")
             return
         try:
-            os.startfile(str(p))
+            self._open_file_with_default_app(str(p))
         except Exception:
-            try:
-                subprocess.Popen(["xdg-open", str(p)])
-            except Exception:
-                QMessageBox.critical(self, "错误", "无法打开文件，请手动打开。")
+            QMessageBox.critical(self, "错误", "无法打开文件，请手动打开。")
+
+    @staticmethod
+    def _open_file_with_default_app(path: str) -> None:
+        """跨平台用默认程序打开文件。"""
+        import platform
+        system = platform.system()
+        if system == "Windows":
+            os.startfile(path)
+        elif system == "Darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
 
     def _load_train_defaults(self):
         self._apply_config(TrainConfig())
