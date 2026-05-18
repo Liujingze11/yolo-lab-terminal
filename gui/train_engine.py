@@ -85,6 +85,7 @@ def build_train_kwargs(config, use_augment):
         "device": config.device,
         "project": config.results_dir,
         "name": config.experiment_name,
+        "exist_ok": True,  # 使用精确实验名，避免 YOLO 自动追加后缀
     }
     if use_augment:
         kwargs.update({
